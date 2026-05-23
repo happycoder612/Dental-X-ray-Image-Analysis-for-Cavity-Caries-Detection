@@ -1,0 +1,179 @@
+import cv2
+import numpy as np
+from skimage import measure, morphology, exposure
+from skimage.morphology import disk
+from skimage.feature import graycomatrix, graycoprops
+
+def clahe_gray(img):
+    if img.ndim == 3:
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    return clahe.apply(img)
+
+def median_denoise(img, k=5):
+    return cv2.medianBlur(img, k)
+
+def morph_open_gray(img, r):
+    se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*r+1, 2*r+1))
+    return cv2.morphologyEx(img, cv2.MORPH_OPEN, se)
+
+def black_hat(img, r):
+    se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*r+1, 2*r+1))
+    return cv2.morphologyEx(img, cv2.MORPH_BLACKHAT, se)
+
+def otsu(img):
+    _, th = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return th
+
+def fill_holes(binary):
+    # Fill with floodfill from border
+    h, w = binary.shape
+    mask = np.zeros((h+2, w+2), np.uint8)
+    im_inv = cv2.bitwise_not(binary)
+    flood = im_inv.copy()
+    cv2.floodFill(flood, mask, (0,0), 255)
+    holes = cv2.bitwise_not(flood)
+    return cv2.bitwise_or(binary, holes)
+
+def largest_components(bin_img, min_area=2000, keep_top_k=None):
+    labels = measure.label(bin_img, connectivity=2)
+    props = measure.regionprops(labels)
+    keep = np.zeros_like(bin_img, dtype=np.uint8)
+    areas = sorted([(p.area, p.label) for p in props], reverse=True)
+    if keep_top_k is not None:
+        labels_to_keep = set([lab for _, lab in areas[:keep_top_k]])
+    else:
+        labels_to_keep = set([p.label for p in props if p.area >= min_area])
+    for p in props:
+        if p.label in labels_to_keep:
+            keep[labels == p.label] = 255
+    return keep
+
+def distance_to_boundary(mask):
+    # distance inside teeth to nearest boundary (0 at boundary)
+    # compute distance on the eroded mask so interior distances are positive
+    inv = (mask == 0).astype(np.uint8)
+    dist = cv2.distanceTransform(255 - mask, cv2.DIST_L2, 3)
+    return dist
+
+def local_mean(img, k=31):
+    return cv2.blur(img.astype(np.float32), (k, k))
+
+def region_glcm_features(gray_roi):
+    g = np.clip(gray_roi, 0, 255).astype(np.uint8)
+    # quantize to 32 levels to stabilize
+    gq = (g / 8).astype(np.uint8)
+    glcm = graycomatrix(gq, [1], [0], levels=32, symmetric=True, normed=True)
+    contrast = graycoprops(glcm, 'contrast')[0,0]
+    homogeneity = graycoprops(glcm, 'homogeneity')[0,0]
+    return contrast, homogeneity
+
+def detect_caries(xray_bgr):
+    # 1) Preprocess
+    g0 = cv2.cvtColor(xray_bgr, cv2.COLOR_BGR2GRAY) if xray_bgr.ndim==3 else xray_bgr.copy()
+    g1 = median_denoise(g0, 5)
+    g2 = clahe_gray(g1)
+    bg = morph_open_gray(g2, r=35)                       # illumination estimate
+    norm = cv2.normalize(cv2.subtract(g2, bg), None, 0, 255, cv2.NORM_MINMAX)
+    bh = black_hat(g2, r=13)                             # emphasize dark lesions
+
+    # 2) Tooth mask
+    th = otsu(exposure.rescale_intensity(g2, out_range=(0,255)).astype(np.uint8))
+    th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(7,7)))
+    th = cv2.morphologyEx(th, cv2.MORPH_OPEN,  cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(5,5)))
+    th = fill_holes(th)
+    teeth_mask = largest_components(th, min_area=2000)   # keep big tooth blobs only
+
+    # 3) Candidate extraction (dark + on teeth + near boundary)
+    # Normalize black-hat and threshold
+    bh_norm = cv2.normalize(bh, None, 0, 255, cv2.NORM_MINMAX)
+    _, cand_bh = cv2.threshold(bh_norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # Limit to teeth
+    candidates = cv2.bitwise_and(cand_bh, teeth_mask)
+
+    # Near boundary band
+    dist = distance_to_boundary(teeth_mask)
+    # keep pixels within 4..12 px from boundary
+    near = ((dist >= 4) & (dist <= 12)).astype(np.uint8) * 255
+    candidates = cv2.bitwise_and(candidates, near)
+
+    # Cleanup small specks
+    candidates = cv2.morphologyEx(candidates, cv2.MORPH_OPEN,
+                                  cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(3,3)))
+    # 4) Connected component analysis + rule-based filtering
+    labels = measure.label(candidates, connectivity=2)
+    props = measure.regionprops(labels, intensity_image=g2)
+
+    keep_mask = np.zeros_like(candidates)
+    I = g2.astype(np.float32)
+    I_local = local_mean(I, 25)
+
+    for p in props:
+        area = p.area
+        if area < 20 or area > 3000:
+            continue
+
+        # Shape cues
+        solidity = p.solidity if p.solidity is not None else 1.0
+        extent = p.extent
+        # Intensity contrast (darker than neighborhood)
+        rr, cc = p.coords[:,0], p.coords[:,1]
+        mean_int = I[rr, cc].mean()
+        local_mean_int = I_local[rr, cc].mean()
+        contrast_ratio = mean_int / (local_mean_int + 1e-6)
+
+        # Optional texture (small ROI around centroid)
+        r0, c0 = map(int, p.centroid)
+        pad = 10
+        r1, r2 = max(0, r0-pad), min(I.shape[0], r0+pad+1)
+        c1, c2 = max(0, c0-pad), min(I.shape[1], c0+pad+1)
+        roi = I[r1:r2, c1:c2].astype(np.uint8)
+        try:
+            glcm_contrast, glcm_homog = region_glcm_features(roi)
+        except Exception:
+            glcm_contrast, glcm_homog = 0.0, 1.0
+
+        # Simple rule-set (tune thresholds)
+        rules = [
+            solidity <= 0.95,              # irregular border
+            extent <= 0.75,                # not filling its bbox
+            contrast_ratio <= 0.90,        # clearly darker than local neighborhood
+            glcm_homog <= 0.60 or glcm_contrast >= 2.0  # texture cue
+        ]
+        if sum(rules) >= 2:                # require at least two cues
+            keep_mask[labels == p.label] = 255
+
+    # Merge nearby regions a bit
+    keep_mask = cv2.morphologyEx(keep_mask, cv2.MORPH_CLOSE,
+                                 cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(5,5)))
+
+    # 5) Visualization overlay
+    overlay = cv2.cvtColor(g0, cv2.COLOR_GRAY2BGR) if xray_bgr.ndim==2 else xray_bgr.copy()
+    contours, _ = cv2.findContours(keep_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(overlay, contours, -1, (0,0,255), 2)
+
+    return {
+        "teeth_mask": teeth_mask,
+        "candidate_mask": candidates,
+        "cavity_mask": keep_mask,
+        "overlay": overlay,
+        "blackhat": bh_norm,
+        "illum_corrected": norm
+    }
+
+if __name__ == "__main__":
+    import sys
+    import os
+    path = sys.argv[1] if len(sys.argv) > 1 else "sample_xray.png"
+    img = cv2.imread(path, cv2.IMREAD_COLOR)
+    out = detect_caries(img)
+
+    base = os.path.splitext(os.path.basename(path))[0]
+    cv2.imwrite(f"{base}_teeth_mask.png", out["teeth_mask"])
+    cv2.imwrite(f"{base}_candidates.png", out["candidate_mask"])
+    cv2.imwrite(f"{base}_caries_mask.png", out["cavity_mask"])
+    cv2.imwrite(f"{base}_overlay.png", out["overlay"])
+    cv2.imwrite(f"{base}_blackhat.png", out["blackhat"])
+    cv2.imwrite(f"{base}_illum.png", out["illum_corrected"])
+    print("Saved outputs next to input.")
